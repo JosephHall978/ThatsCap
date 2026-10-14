@@ -1,0 +1,4 @@
+SpeechRecognition
+moviepy
+faster-whisper
+ffmpeg-python
