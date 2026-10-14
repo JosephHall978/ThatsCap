@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 
+import huggingface_hub
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -33,9 +34,8 @@ class Config:
 
         # Transcription backend
         self.recognizer = os.getenv("RECOGNIZER", "local").lower()
-        self.whisper_model = os.getenv("WHISPER_MODEL", "small")
-        self.whisper_device = os.getenv("WHISPER_DEVICE", "cpu")
-        self.whisper_compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+        self.hf_model = os.getenv("HF_MODEL", "openai/whisper-small")
+        self.hf_device = os.getenv("HF_DEVICE", "auto").lower()
 
         self.sub_font = os.getenv("SUB_FONT", "Arial")
         self.sub_fontsize = int(os.getenv("SUB_FONTSIZE", "28"))
@@ -45,6 +45,28 @@ class Config:
         self.sub_margin = int(os.getenv("SUB_MARGIN", "60"))
 
         self.processed_file = os.path.join(self.output_dir, ".captioner_processed")
+
+        # Video encoding: av1/h264 (GPU) or libx264/libx265 (CPU)
+        self.vcodec = os.getenv("VCODEC", "libx264").lower()
+        self.v_preset = os.getenv("V_PRESET", "medium")
+        # CRF for x264/x265; CQ/qp for NVENC/AV1 GPU encoders
+        self.v_quality = os.getenv("V_QUALITY", "20")
+
+        # Auto-set sensible defaults per codec if not overridden
+        defaults = {
+            "libx264":  {"preset": "medium",  "quality": "20", "mode": "crf"},
+            "libx265":  {"preset": "medium",  "quality": "26", "mode": "crf"},
+            "h264_nvenc":  {"preset": "p5",    "quality": "23", "mode": "cq"},
+            "hevc_nvenc":  {"preset": "p5",    "quality": "28", "mode": "cq"},
+            "av1_nvenc":   {"preset": "p5",    "quality": "35", "mode": "cq"},
+        }
+        d = defaults.get(self.vcodec)
+        if d:
+            if os.getenv("V_PRESET") is None: self.v_preset = d["preset"]
+            if os.getenv("V_QUALITY") is None: self.v_quality = d["quality"]
+            self._v_qmode = d["mode"]
+        else:
+            self._v_qmode = os.getenv("V_QMODE", "crf").lower()
 
     def validate(self) -> None:
         if not self.monitor_dir:
@@ -170,14 +192,29 @@ def extract_audio(video_path: str, wav_path: str) -> None:
     ])
 
 
+def build_encode_args() -> list:
+    """Codec-specific quality/preset args (crf for CPU, cq/qp for NVENC)."""
+    c = CONFIG
+    mode = getattr(c, "_v_qmode", "crf")
+    preset_flag = {
+        "h264_nvenc": "-preset", "hevc_nvenc": "-preset", "av1_nvenc": "-preset",
+    }.get(c.vcodec, "-preset")
+    quality_flag = {
+        "crf": "-crf", "cq": "-cq", "qp": "-qp",
+    }.get(mode, "-crf")
+    return [
+        "-c:v", c.vcodec,
+        preset_flag, c.v_preset,
+        quality_flag, c.v_quality,
+    ]
+
+
 def burn_subtitles(video_input: str, srt_input: str, video_output: str, info: dict) -> None:
     """Burn an .srt into the video, writing atomically to video_output."""
     work = tempfile.mkdtemp(prefix="captioner_burn_")
     root, ext = os.path.splitext(video_output)
     partial = root + ".partial" + ext
     try:
-        # Copy the srt to a plain relative name: avoids Windows drive-letter /
-        # backslash escaping problems inside the ffmpeg filter string.
         shutil.copy(srt_input, os.path.join(work, "subs.srt"))
 
         style = (
@@ -189,23 +226,18 @@ def burn_subtitles(video_input: str, srt_input: str, video_output: str, info: di
         )
         vf = "subtitles=subs.srt"
         if info.get("width") and info.get("height"):
-            # Makes Fontsize/MarginV be in real video pixels
             vf += f":original_size={info['width']}x{info['height']}"
         vf += f":force_style='{style}'"
 
+        cmd = [
+            "ffmpeg", "-y", "-v", "error", "-i", video_input,
+            "-vf", vf,
+            *build_encode_args(),
+            "-c:a", "aac", "-b:a", "192k",
+            partial,
+        ]
         try:
-            # We dynamically inject your existing 'vf' string and mix all audio tracks
-            filter_complex_str = f"[0:v:0]{vf}[v];[0:a]amix=inputs=2:duration=longest[a]"
-
-            _run([
-                "ffmpeg", "-y", "-v", "error", "-i", video_input,
-                "-filter_complex", filter_complex_str,
-                "-map", "[v]",
-                "-map", "[a]",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                "-c:a", "aac", "-b:a", "192k",  # Re-encoding is required to merge audio
-                partial,
-            ], cwd=work)
+            _run(cmd, cwd=work)
             os.replace(partial, video_output)
         finally:
             if os.path.exists(partial):
@@ -218,59 +250,43 @@ def burn_subtitles(video_input: str, srt_input: str, video_output: str, info: di
 # Transcription backends
 # ---------------------------------------------------------------------------
 
-_whisper_model = None
-_whisper_device = None
+_asr_pipeline = None
 
 
-def _load_whisper(device: str, compute_type: str):
-    from faster_whisper import WhisperModel
+def _get_asr():
+    global _asr_pipeline
+    if _asr_pipeline is None:
+        import torch
+        from transformers import pipeline
 
-    log.info(
-        "Loading Whisper model %r (device=%s, compute=%s)",
-        CONFIG.whisper_model, device, compute_type,
-    )
-    return WhisperModel(CONFIG.whisper_model, device=device, compute_type=compute_type)
-
-
-def _get_whisper():
-    global _whisper_model, _whisper_device
-    if _whisper_model is None:
-        try:
-            _whisper_device = CONFIG.whisper_device
-            _whisper_model = _load_whisper(_whisper_device, CONFIG.whisper_compute_type)
-        except Exception as exc:
-            if CONFIG.whisper_device == "cpu":
-                raise
-            log.warning("Could not load Whisper on %s (%s), falling back to CPU",
-                        CONFIG.whisper_device, exc)
-            _whisper_device = "cpu"
-            _whisper_model = _load_whisper("cpu", "int8")
-    return _whisper_model
-
-
-def _whisper_transcribe(audio_path: str) -> list:
-    model = _get_whisper()
-    segments_iter, info = model.transcribe(
-        audio_path, word_timestamps=False, vad_filter=True
-    )
-    log.info("Detected language: %s (prob %.2f)",
-             info.language, info.language_probability)
-    # The iterator is lazy; CUDA errors can surface while consuming it
-    return [{"start": s.start, "end": s.end, "text": s.text} for s in segments_iter]
+        device = CONFIG.hf_device
+        if device == "auto":
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        log.info("Loading HF model %r (device=%s)", CONFIG.hf_model, device)
+        _asr_pipeline = pipeline(
+            "automatic-speech-recognition",
+            model=CONFIG.hf_model,
+            device=device,
+            chunk_length_s=30,  # lets long clips be transcribed in windows
+            token=os.getenv("HF_TOKEN", None)
+        )
+    return _asr_pipeline
 
 
 def transcribe_local(audio_path: str) -> list:
-    """Transcribe with a local Whisper model via faster-whisper."""
-    global _whisper_model, _whisper_device
-    try:
-        return _whisper_transcribe(audio_path)
-    except RuntimeError as exc:
-        if _whisper_device == "cpu":
-            raise
-        log.warning("Whisper failed on %s (%s), retrying on CPU", _whisper_device, exc)
-        _whisper_device = "cpu"
-        _whisper_model = _load_whisper("cpu", "int8")
-        return _whisper_transcribe(audio_path)
+    """Transcribe with a Hugging Face ASR pipeline (e.g. openai/whisper-small).
+    Requires ffmpeg on PATH (already needed) to read the wav."""
+    asr = _get_asr()
+    result = asr(audio_path, return_timestamps=True)
+    segments = []
+    for chunk in result.get("chunks", []):
+        start, end = chunk["timestamp"]
+        if start is None:
+            continue
+        if end is None:  # final chunk can lack an end time
+            end = start + 2.0
+        segments.append({"start": start, "end": end, "text": chunk["text"]})
+    return segments
 
 
 def transcribe_google(audio_path: str, duration: float) -> list:

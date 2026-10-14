@@ -1,4 +1,5 @@
 SpeechRecognition
 moviepy
-faster-whisper
+transformers
 ffmpeg-python
+torch
