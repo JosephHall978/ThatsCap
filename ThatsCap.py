@@ -1,12 +1,12 @@
+import json
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import time
-import ffmpeg
 
 from dotenv import load_dotenv
-
-import tempfile
-from moviepy import VideoFileClip, TextClip
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -14,19 +14,22 @@ from moviepy import VideoFileClip, TextClip
 
 load_dotenv()
 
+CAPTION_SUFFIX = "_captioned"
 
 class Config:
-    """All settings, loaded from environment / .env with sensible defaults."""
-
     def __init__(self) -> None:
-        self.monitor_dir = os.getenv("MONITOR_DIR", "").strip()
-        self.output_dir = os.getenv("OUTPUT_DIR", str(self.monitor_dir)).strip()
+        monitor = os.getenv("MONITOR_DIR", "").strip()
+        output = os.getenv("OUTPUT_DIR", "").strip()
+        self.monitor_dir = os.path.abspath(monitor) if monitor else ""
+        self.output_dir = os.path.abspath(output) if output else self.monitor_dir
+
         self.video_exts = {
             ext.strip().lower()
             for ext in os.getenv("VIDEO_EXTS", ".mp4,.avi,.mov").split(",")
             if ext.strip()
         }
         self.poll_interval = float(os.getenv("POLL_INTERVAL", "60"))
+        self.settle_seconds = float(os.getenv("SETTLE_SECONDS", "5"))
 
         # Transcription backend
         self.recognizer = os.getenv("RECOGNIZER", "local").lower()
@@ -34,7 +37,6 @@ class Config:
         self.whisper_device = os.getenv("WHISPER_DEVICE", "cpu")
         self.whisper_compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 
-        # Subtitle styling
         self.sub_font = os.getenv("SUB_FONT", "Arial")
         self.sub_fontsize = int(os.getenv("SUB_FONTSIZE", "28"))
         self.sub_color = os.getenv("SUB_COLOR", "white")
@@ -42,16 +44,19 @@ class Config:
         self.sub_stroke_width = int(os.getenv("SUB_STROKE_WIDTH", "1"))
         self.sub_margin = int(os.getenv("SUB_MARGIN", "60"))
 
-        # Tracks already-processed videos (one path per line)
-        self.processed_file = self.output_dir + ".captioner_processed"
+        self.processed_file = os.path.join(self.output_dir, ".captioner_processed")
 
     def validate(self) -> None:
         if not self.monitor_dir:
-            raise FileNotFoundError(
-                f"MONITOR_DIR does is not set: {self.monitor_dir}"
-            )
+            raise ValueError("MONITOR_DIR is not set")
         if not os.path.isdir(self.monitor_dir):
-            os.mkdir(self.output_dir)
+            raise FileNotFoundError(
+                f"MONITOR_DIR does not exist: {self.monitor_dir}"
+            )
+        os.makedirs(self.output_dir, exist_ok=True)
+        for tool in ("ffmpeg", "ffprobe"):
+            if shutil.which(tool) is None:
+                raise FileNotFoundError(f"{tool} was not found on PATH")
 
 
 CONFIG = Config()
@@ -79,52 +84,134 @@ def _format_srt_timestamp(seconds: float) -> str:
 
 def write_srt(segments: list, path: str) -> str:
     """Write whisper-style segments (start/end/text) to an .srt file."""
-    lines = []
-    for i, seg in enumerate(segments, start=1):
-        lines.append(str(i))
-        lines.append(
-            f"{_format_srt_timestamp(seg['start'])} --> "
-            f"{_format_srt_timestamp(seg['end'])}"
-        )
-        text = seg["text"].strip()
-        lines.append(text)
-        lines.append("")
-
-    with open(path, "w+", encoding="utf-8") as f:
-        f.writelines(lines)
-
-    return path
-
-
-def wrap_text(text: str, max_chars: int = 42) -> list[str]:
-    """Split long text into subtitle-sized chunks of <= 2 lines."""
-    words, lines, current = text.split(), [], ""
-    for word in words:
-        if len(current) + len(word) + 1 > max_chars and current:
-            lines.append(current)
-            current = word
-        else:
-            current = f"{current} {word}".strip()
-    if current:
-        lines.append(current)
-    # Pair lines up so each caption is at most 2 lines
-    return [lines[i : i + 2] for i in range(0, len(lines), 2)]
-
-
-def build_clip_texts(segments: list) -> list:
-    """Turn raw segments into styled, chunked caption entries."""
-    entries = []
+    blocks = []
+    index = 1
     for seg in segments:
         text = seg["text"].strip()
         if not text:
             continue
-        chunks = wrap_text(text)
-        span = max(seg["end"] - seg["start"], 0.1) / len(chunks)
-        for i, chunk in enumerate(chunks):
-            start = seg["start"] + i * span
-            end = min(start + span, seg["end"]) if i < len(chunks) - 1 else seg["end"]
-            entries.append({"start": start, "end": max(end, start + 0.5), "text": "\n".join(chunk)})
-    return entries
+        blocks.append(
+            f"{index}\n"
+            f"{_format_srt_timestamp(seg['start'])} --> "
+            f"{_format_srt_timestamp(seg['end'])}\n"
+            f"{text}\n"
+        )
+        index += 1
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(blocks))
+    return path
+
+
+_NAMED_COLORS = {
+    "white": "FFFFFF",
+    "black": "000000",
+    "red": "FF0000",
+    "green": "00FF00",
+    "blue": "0000FF",
+    "yellow": "FFFF00",
+    "cyan": "00FFFF",
+    "magenta": "FF00FF",
+    "orange": "FFA500",
+    "gray": "808080",
+    "grey": "808080",
+}
+
+
+def ass_color(value: str, default: str = "FFFFFF") -> str:
+    """Convert 'white' / '#RRGGBB' into libass '&H00BBGGRR' format."""
+    v = value.strip().lower()
+    if v.startswith("#"):
+        v = v[1:]
+    rgb = _NAMED_COLORS.get(v, v).upper()
+    if len(rgb) != 6 or any(c not in "0123456789ABCDEF" for c in rgb):
+        log.warning("Unrecognised colour %r, using default", value)
+        rgb = default
+    r, g, b = rgb[0:2], rgb[2:4], rgb[4:6]
+    return f"&H00{b}{g}{r}"
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg helpers
+# ---------------------------------------------------------------------------
+
+
+def _run(cmd: list, cwd: str = None) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", cwd=cwd,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} failed: {result.stderr.strip()[-800:]}")
+    return result
+
+
+def probe_video(path: str) -> dict:
+    out = _run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=codec_type,width,height:format=duration",
+        "-of", "json", path,
+    ]).stdout
+    data = json.loads(out)
+    streams = data.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    return {
+        "has_audio": any(s.get("codec_type") == "audio" for s in streams),
+        "width": video.get("width"),
+        "height": video.get("height"),
+        "duration": float(data.get("format", {}).get("duration") or 0),
+    }
+
+
+def extract_audio(video_path: str, wav_path: str) -> None:
+    _run([
+        "ffmpeg", "-y", "-v", "error", "-i", video_path,
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path,
+    ])
+
+
+def burn_subtitles(video_input: str, srt_input: str, video_output: str, info: dict) -> None:
+    """Burn an .srt into the video, writing atomically to video_output."""
+    work = tempfile.mkdtemp(prefix="captioner_burn_")
+    root, ext = os.path.splitext(video_output)
+    partial = root + ".partial" + ext
+    try:
+        # Copy the srt to a plain relative name: avoids Windows drive-letter /
+        # backslash escaping problems inside the ffmpeg filter string.
+        shutil.copy(srt_input, os.path.join(work, "subs.srt"))
+
+        style = (
+            f"Fontname={CONFIG.sub_font},Fontsize={CONFIG.sub_fontsize},"
+            f"PrimaryColour={ass_color(CONFIG.sub_color)},"
+            f"OutlineColour={ass_color(CONFIG.sub_stroke_color, '000000')},"
+            f"BorderStyle=1,Outline={CONFIG.sub_stroke_width},Shadow=0,"
+            f"Alignment=2,MarginV={CONFIG.sub_margin}"
+        )
+        vf = "subtitles=subs.srt"
+        if info.get("width") and info.get("height"):
+            # Makes Fontsize/MarginV be in real video pixels
+            vf += f":original_size={info['width']}x{info['height']}"
+        vf += f":force_style='{style}'"
+
+        try:
+            # We dynamically inject your existing 'vf' string and mix all audio tracks
+            filter_complex_str = f"[0:v:0]{vf}[v];[0:a]amix=inputs=2:duration=longest[a]"
+
+            _run([
+                "ffmpeg", "-y", "-v", "error", "-i", video_input,
+                "-filter_complex", filter_complex_str,
+                "-map", "[v]",
+                "-map", "[a]",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-c:a", "aac", "-b:a", "192k",  # Re-encoding is required to merge audio
+                partial,
+            ], cwd=work)
+            os.replace(partial, video_output)
+        finally:
+            if os.path.exists(partial):
+                os.remove(partial)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -132,37 +219,63 @@ def build_clip_texts(segments: list) -> list:
 # ---------------------------------------------------------------------------
 
 _whisper_model = None
+_whisper_device = None
 
 
-def transcribe_local(audio_path: str) -> list:
-    """Transcribe with a local Hugging Face Whisper model via faster-whisper."""
-    global _whisper_model
+def _load_whisper(device: str, compute_type: str):
+    from faster_whisper import WhisperModel
+
+    log.info(
+        "Loading Whisper model %r (device=%s, compute=%s)",
+        CONFIG.whisper_model, device, compute_type,
+    )
+    return WhisperModel(CONFIG.whisper_model, device=device, compute_type=compute_type)
+
+
+def _get_whisper():
+    global _whisper_model, _whisper_device
     if _whisper_model is None:
-        from faster_whisper import WhisperModel
+        try:
+            _whisper_device = CONFIG.whisper_device
+            _whisper_model = _load_whisper(_whisper_device, CONFIG.whisper_compute_type)
+        except Exception as exc:
+            if CONFIG.whisper_device == "cpu":
+                raise
+            log.warning("Could not load Whisper on %s (%s), falling back to CPU",
+                        CONFIG.whisper_device, exc)
+            _whisper_device = "cpu"
+            _whisper_model = _load_whisper("cpu", "int8")
+    return _whisper_model
 
-        log.info(
-            "Loading Whisper model %r (device=%s, compute=%s)",
-            CONFIG.whisper_model,
-            CONFIG.whisper_device,
-            CONFIG.whisper_compute_type,
-        )
-        _whisper_model = WhisperModel(
-            CONFIG.whisper_model,
-            device=CONFIG.whisper_device,
-            compute_type=CONFIG.whisper_compute_type,
-        )
 
-    segments_iter, info = _whisper_model.transcribe(
+def _whisper_transcribe(audio_path: str) -> list:
+    model = _get_whisper()
+    segments_iter, info = model.transcribe(
         audio_path, word_timestamps=False, vad_filter=True
     )
-    log.info(
-        "Detected language: %s (prob %.2f)", info.language, info.language_probability
-    )
+    log.info("Detected language: %s (prob %.2f)",
+             info.language, info.language_probability)
+    # The iterator is lazy; CUDA errors can surface while consuming it
     return [{"start": s.start, "end": s.end, "text": s.text} for s in segments_iter]
 
 
-def transcribe_google(audio_path: str) -> list:
-    """Fallback: Google Web Speech API. No timestamps, so use one caption."""
+def transcribe_local(audio_path: str) -> list:
+    """Transcribe with a local Whisper model via faster-whisper."""
+    global _whisper_model, _whisper_device
+    try:
+        return _whisper_transcribe(audio_path)
+    except RuntimeError as exc:
+        if _whisper_device == "cpu":
+            raise
+        log.warning("Whisper failed on %s (%s), retrying on CPU", _whisper_device, exc)
+        _whisper_device = "cpu"
+        _whisper_model = _load_whisper("cpu", "int8")
+        return _whisper_transcribe(audio_path)
+
+
+def transcribe_google(audio_path: str, duration: float) -> list:
+    """Fallback: Google Web Speech API. No timestamps, so one caption for the
+    whole clip (the API also only handles short clips)."""
     import speech_recognition as sr
 
     recognizer = sr.Recognizer()
@@ -175,105 +288,154 @@ def transcribe_google(audio_path: str) -> list:
         return []
     except sr.RequestError as exc:
         raise RuntimeError(f"Google Speech API error: {exc}") from exc
-    return [{"start": 0.0, "end": None, "text": text}]
+    return [{"start": 0.0, "end": max(duration, 0.5), "text": text}]
 
 
 def transcribe_audio(audio_path: str, duration: float) -> list:
     if CONFIG.recognizer == "google":
-        return transcribe_google(audio_path)
+        return transcribe_google(audio_path, duration)
     return transcribe_local(audio_path)
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+
+def output_path_for(video_path: str) -> str:
+    """Where the captioned version of video_path lives (mirrors subfolders)."""
+    rel_dir, name = os.path.split(os.path.relpath(video_path, CONFIG.monitor_dir))
+    stem, ext = os.path.splitext(name)
+    return os.path.join(CONFIG.output_dir, rel_dir, stem + CAPTION_SUFFIX + ext)
+
+
+def is_caption_output(filename: str) -> bool:
+    return os.path.splitext(filename)[0].endswith(CAPTION_SUFFIX)
 
 
 # ---------------------------------------------------------------------------
 # Video processing
 # ---------------------------------------------------------------------------
-def burn_subtitles(video_input, srt_input, video_output):
-    try:
-        stream = ffmpeg.input(video_input)
-        video = stream.video.filter('subtitles', srt_input, force_style='Fontname=Arial,Fontsize=16')
-        audio = stream.audio
-        output = ffmpeg.output(video, audio, video_output, vcodec='libx264', acodec='copy')
-        ffmpeg.run(output, overwrite_output=True)
-        log.info("Burning subtitles -> %s", video_output.name)
-    except ffmpeg.Error as e:
-        log.warning("Could not burn subtitles -> %s", video_output.name)
 
 
-def process_video(video_path: str) -> None:
+def process_video(video_path: str) -> bool:
+    """Caption one video. Returns False if there was nothing to caption
+    (no audio / no speech), True if a captioned file was written."""
     log.info("Processing %s", video_path)
-    with VideoFileClip(video_path) as video:
-        if video.audio is None:
-            log.warning("No audio track in %s, skipping.", video_path)
-            return
-        duration = video.duration
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            audio_path = os.path.basename(tmp)
-        try:
-            video.audio.write_audiofile(
-                str(audio_path), logger=None, codec="pcm_s16le"
-            )
-            segments = transcribe_audio(audio_path, duration)
-        finally:
-            audio_path.unlink(missing_ok=True)
+    info = probe_video(video_path)
+    if not info["has_audio"]:
+        log.warning("No audio track in %s, skipping.", video_path)
+        return False
+
+    output_path = output_path_for(video_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    tmpdir = tempfile.mkdtemp(prefix="captioner_")
+    try:
+        wav_path = os.path.join(tmpdir, "audio.wav")
+        extract_audio(video_path, wav_path)
+        segments = transcribe_audio(wav_path, info["duration"])
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     if not segments:
         log.warning("No speech detected in %s, skipping.", video_path)
-        return
+        return False
 
-    base = os.path.dirname(video_path)
-    srt_path = write_srt(segments, CONFIG.output_dir / f"{base}.srt")
-    output_path = CONFIG.output_dir / f"{base}_captioned{os.path.basename(video_path)}"
-    burn_subtitles(video_path, srt_path, output_path)
-    log.info("Done: %s", output_path.name)
+    srt_path = write_srt(segments, os.path.splitext(output_path)[0] + ".srt")
+    log.info("Burning subtitles -> %s", os.path.basename(output_path))
+    burn_subtitles(video_path, srt_path, output_path, info)
+    log.info("Done: %s", output_path)
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Directory monitoring
 # ---------------------------------------------------------------------------
 
+# Videos that failed this session; retried on next restart, not every poll
+_failed = set()
+
 
 def load_processed() -> set:
-    if os.path.exists(CONFIG.processed_file):
-        return {
-            line.strip()
-            for line in CONFIG.processed_file.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        }
-    return set()
+    if not os.path.exists(CONFIG.processed_file):
+        return set()
+    with open(CONFIG.processed_file, "r", encoding="utf-8") as fh:
+        return {line.strip() for line in fh if line.strip()}
 
 
 def mark_processed(path: str) -> None:
-    with CONFIG.processed_file.open("a", encoding="utf-8") as fh:
+    with open(CONFIG.processed_file, "a", encoding="utf-8") as fh:
         fh.write(path + "\n")
 
 
-def scan_directory() -> None:
+def find_uncaptioned() -> list:
+    """Every video under MONITOR_DIR (recursively) with no captioned version
+    in the output dir yet. This covers new clips and old backlog alike."""
     processed = load_processed()
-    for entry, dirs, names in os.walk(CONFIG.monitor_dir):
-        entry = os.sep.join(entry)
-        if (
-            os.path.isfile(entry)
-            and os.path.basename(entry).lower() in CONFIG.video_exts
-            and str(entry) not in processed
-        ):
+    out_root = os.path.normcase(CONFIG.output_dir)
+    monitor_root = os.path.normcase(CONFIG.monitor_dir)
+    now = time.time()
+    pending = []
+
+    for root, dirs, files in os.walk(CONFIG.monitor_dir):
+        # Don't descend into the output folder when it sits inside the monitor
+        # folder (but it's fine if they're the same folder)
+        if out_root != monitor_root:
+            dirs[:] = [
+                d for d in dirs
+                if os.path.normcase(os.path.join(root, d)) != out_root
+            ]
+
+        for name in sorted(files):
+            stem, ext = os.path.splitext(name)
+            if ext.lower() not in CONFIG.video_exts:
+                continue
+            if is_caption_output(name) or ".partial" in stem:
+                continue
+
+            path = os.path.join(root, name)
+            if path in processed or path in _failed:
+                continue
+            if os.path.exists(output_path_for(path)):
+                continue
             try:
-                process_video(entry)
-                mark_processed(str(entry))
-            except Exception:
-                log.exception("Failed to process %s", names)
+                if now - os.path.getmtime(path) < CONFIG.settle_seconds:
+                    continue  # probably still being written
+            except OSError:
+                continue
+            pending.append(path)
+
+    return pending
+
+
+def scan_directory() -> None:
+    pending = find_uncaptioned()
+    if pending:
+        log.info("%d video(s) without a captioned version", len(pending))
+
+    for path in pending:
+        try:
+            if not process_video(path):
+                mark_processed(path)  # nothing to caption; don't retry
+        except Exception:
+            _failed.add(path)
+            log.exception("Failed to process %s", path)
 
 
 def main() -> None:
     CONFIG.validate()
     log.info(
-        "Monitoring %s (every %ss, backend=%s)",
-        CONFIG.monitor_dir,
-        CONFIG.poll_interval,
-        CONFIG.recognizer,
+        "Monitoring %s -> %s (every %ss, backend=%s)",
+        CONFIG.monitor_dir, CONFIG.output_dir,
+        CONFIG.poll_interval, CONFIG.recognizer,
     )
-    while True:
-        scan_directory()
-        time.sleep(CONFIG.poll_interval)
+    try:
+        while True:
+            scan_directory()
+            time.sleep(CONFIG.poll_interval)
+    except KeyboardInterrupt:
+        log.info("Stopped.")
 
 
 if __name__ == "__main__":
