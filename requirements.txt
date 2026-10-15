@@ -3,3 +3,5 @@ moviepy
 transformers
 ffmpeg-python
 torch
+soundfile
+accelerate

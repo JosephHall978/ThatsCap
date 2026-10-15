@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -36,6 +37,9 @@ class Config:
         self.recognizer = os.getenv("RECOGNIZER", "local").lower()
         self.hf_model = os.getenv("HF_MODEL", "openai/whisper-small")
         self.hf_device = os.getenv("HF_DEVICE", "auto").lower()
+        self.granite_window = float(os.getenv("GRANITE_WINDOW", "150"))
+        self.granite_max_words = int(os.getenv("GRANITE_MAX_WORDS", "14"))
+        self.granite_gap_break = float(os.getenv("GRANITE_GAP_BREAK", "0.8"))
 
         self.sub_font = os.getenv("SUB_FONT", "Arial")
         self.sub_fontsize = int(os.getenv("SUB_FONTSIZE", "28"))
@@ -67,6 +71,10 @@ class Config:
             self._v_qmode = d["mode"]
         else:
             self._v_qmode = os.getenv("V_QMODE", "crf").lower()
+
+    @property
+    def use_granite(self) -> bool:
+        return "granite-speech" in self.hf_model.lower()
 
     def validate(self) -> None:
         if not self.monitor_dir:
@@ -289,6 +297,159 @@ def transcribe_local(audio_path: str) -> list:
     return segments
 
 
+# --- Granite Speech backend (ibm-granite/granite-speech-* models) -----------
+#
+# Granite Speech models are prompt-driven speech-LLMs; they don't work with
+# the plain transformers ASR pipeline. We load the model + processor
+# directly, ask for word-level timestamp tags ([T:N], centiseconds,
+# mod 1000) and convert them into subtitle segments.
+
+_granite_model = None
+
+GRANITE_SYSTEM_PROMPT = (
+    "Knowledge Cutoff Date: April 2024.\n"
+    "Today's Date: December 19, 2024.\n"
+    "You are Granite, developed by IBM. You are a helpful AI assistant"
+)
+GRANITE_TS_PROMPT = (
+    "<|audio|> Timestamps: Transcribe the speech. After each word, add a "
+    "timestamp tag showing the end time in centiseconds, "
+    "e.g. hello [T:45] world [T:82]"
+)
+
+
+def _get_granite():
+    global _granite_model
+    if _granite_model is None:
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+        device = CONFIG.hf_device
+        if device == "auto":
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        log.info("Loading Granite model %r (device=%s)", CONFIG.hf_model, device)
+        processor = AutoProcessor.from_pretrained(
+            CONFIG.hf_model, token=os.getenv("HF_TOKEN", None)
+        )
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            CONFIG.hf_model, device_map=device,
+            token=os.getenv("HF_TOKEN", None),
+        )
+        model.eval()
+        _granite_model = (processor, model, device)
+    return _granite_model
+
+
+def _parse_granite_words(text: str) -> list:
+    """Parse 'hello [T:45] world [T:82] ...' into [(word, end_seconds), ...],
+    unwrapping the 10-second centisecond rollover (see model card)."""
+    parts = re.split(r"\[T:(\d+)\]", text)
+    words = []
+    last_end = 0.0
+    offset = 0.0
+    for word, ts in zip(parts[::2], parts[1::2]):
+        word = word.strip()
+        if not word or word == "_":  # silence marker
+            continue
+        end = float(ts) / 100.0
+        while end + offset < last_end:
+            offset += 10.0
+        last_end = end + offset
+        words.append((word, last_end))
+    return words
+
+
+def _words_to_segments(words: list) -> list:
+    """Group timestamped words into subtitle segments."""
+    segments = []
+    current = []
+    start = None
+    prev_end = 0.0
+
+    def flush():
+        nonlocal current, start
+        if current:
+            segments.append({
+                "start": max(0.0, start),
+                "end": current[-1][1],
+                "text": " ".join(w for w, _ in current),
+            })
+        current = []
+        start = None
+
+    for word, end in words:
+        if start is None:
+            start = prev_end
+        current.append((word, end))
+        prev_end = end
+        if (len(current) >= CONFIG.granite_max_words
+                or end - start >= 6.0):
+            flush()
+    flush()
+    return segments
+
+
+def transcribe_granite(audio_path: str, duration: float) -> list:
+    """Transcribe with a Granite Speech model (word timestamps via [T:N] tags).
+    Audio is processed in windows because the timestamp mode is validated up
+    to ~3.5 minutes of audio."""
+    import soundfile as sf
+    import torch
+
+    processor, model, device = _get_granite()
+    tokenizer = processor.tokenizer
+
+    audio, sr = sf.read(audio_path, dtype="float32")
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    window_samples = int(CONFIG.granite_window * sr)
+    segments = []
+    for i in range(0, max(len(audio), 1), window_samples):
+        chunk = audio[i:i + window_samples]
+        if len(chunk) < sr // 2:  # skip sub-second trailing fragments
+            break
+        offset = i / sr
+
+        chat = [
+            {"role": "system", "content": GRANITE_SYSTEM_PROMPT},
+            {"role": "user", "content": GRANITE_TS_PROMPT},
+        ]
+        prompt_text = tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True
+        )
+        inputs = processor(
+            prompt_text, chunk, device=device, return_tensors="pt"
+        ).to(device)
+
+        with torch.inference_mode():
+            outputs = model.generate(
+                **inputs, max_new_tokens=10000,
+                do_sample=False, num_beams=1,
+            )
+        new_tokens = outputs[0, inputs["input_ids"].shape[-1]:]
+        text = tokenizer.decode(
+            new_tokens, add_special_tokens=False, skip_special_tokens=True
+        )
+
+        words = _parse_granite_words(text)
+        if not words:
+            # Prompt was ignored / no timestamps returned: fall back to a
+            # single caption covering the window.
+            if text.strip():
+                segments.append({
+                    "start": offset,
+                    "end": offset + len(chunk) / sr,
+                    "text": text.strip(),
+                })
+            continue
+        segments.extend(_words_to_segments([
+            (w, end + offset) for w, end in words
+        ]))
+
+    return segments
+
+
 def transcribe_google(audio_path: str, duration: float) -> list:
     """Fallback: Google Web Speech API. No timestamps, so one caption for the
     whole clip (the API also only handles short clips)."""
@@ -310,6 +471,8 @@ def transcribe_google(audio_path: str, duration: float) -> list:
 def transcribe_audio(audio_path: str, duration: float) -> list:
     if CONFIG.recognizer == "google":
         return transcribe_google(audio_path, duration)
+    if CONFIG.use_granite:
+        return transcribe_granite(audio_path, duration)
     return transcribe_local(audio_path)
 
 
