@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 import time
 
-import huggingface_hub
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -275,7 +274,6 @@ def _get_asr():
             "automatic-speech-recognition",
             model=CONFIG.hf_model,
             device=device,
-            chunk_length_s=30,  # lets long clips be transcribed in windows
             token=os.getenv("HF_TOKEN", None)
         )
     return _asr_pipeline
@@ -309,11 +307,12 @@ _granite_model = None
 GRANITE_SYSTEM_PROMPT = (
     "Knowledge Cutoff Date: April 2024.\n"
     "Today's Date: December 19, 2024.\n"
-    "You are Granite, developed by IBM. You are a helpful AI assistant"
+    "You are Granite, developed by IBM. You are a AI moderator, developed by IBM."
+    "You must translate any no English speech to English, otherwise you are to record precisely what is said."
 )
 GRANITE_TS_PROMPT = (
-    "<|audio|> Timestamps: Transcribe the speech. After each word, add a "
-    "timestamp tag showing the end time in centiseconds, "
+    "<|audio|> Timestamps: Transcribe the speech of players in a game for purposes of moderating them (this means it is especially important to transcribe any dog whistles, slurs, or other toxic content.)"
+    "After each word, add a timestamp tag showing the end time in centiseconds, "
     "e.g. hello [T:45] world [T:82]"
 )
 
