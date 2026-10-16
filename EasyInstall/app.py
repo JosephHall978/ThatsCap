@@ -1,9 +1,10 @@
 """
 ThatsCap - friendly web frontend.
 
-Run:      python app.py  (or double-click "Start ThatsCap.bat")
+Run:      python app.py  (or double-click "dailystart.bat")
 Opens:    http://127.0.0.1:8399
 """
+import atexit
 import os
 import shutil
 import string
@@ -18,6 +19,17 @@ from flask import Flask, jsonify, request
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
+
+
+def find_script() -> Path:
+    """ThatsCap.py normally sits one folder above EasyInstall."""
+    for d in (BASE_DIR.parent, BASE_DIR):
+        p = d / "ThatsCap.py"
+        if p.exists():
+            return p
+    return BASE_DIR.parent / "ThatsCap.py"
+
+
 PORT = 8399
 
 app = Flask(__name__)
@@ -60,6 +72,8 @@ def write_env(cfg: dict) -> None:
         "HF_MODEL=" + model,
         "HF_DEVICE=" + ("cuda:0" if gpu else "cpu"),
         "VCODEC=" + ("h264_nvenc" if gpu else "libx264"),
+        "V_PRESET=" + ("p5" if gpu else "medium"),
+        "V_QUALITY=" + ("23" if gpu else "20"),
         "SUB_FONT=" + str(cfg.get("sub_font", "Arial")),
         "SUB_FONTSIZE=" + str(cfg.get("sub_fontsize", 28)),
         "SUB_COLOR=" + str(cfg.get("sub_color", "white")),
@@ -75,8 +89,11 @@ def is_running() -> bool:
 
 
 def _reader(stream) -> None:
-    for raw in iter(stream.readline, ""):
-        _log.append(raw.rstrip())
+    try:
+        for raw in iter(stream.readline, ""):
+            _log.append(raw.rstrip())
+    except (OSError, ValueError):
+        pass
 
 
 def _settings() -> dict:
@@ -110,6 +127,25 @@ def api_status():
     )
 
 
+def _stop_proc() -> None:
+    """Stop ThatsCap.py and any ffmpeg it spawned."""
+    global _proc
+    if _proc is None or _proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(_proc.pid)],
+                       capture_output=True)
+    else:
+        _proc.terminate()
+    try:
+        _proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _proc.kill()
+
+
+atexit.register(_stop_proc)
+
+
 @app.post("/api/start")
 def api_start():
     global _proc
@@ -118,14 +154,31 @@ def api_start():
         return jsonify(ok=False, error="Pick a clips folder first")
     if not os.path.isdir(cfg["monitor_dir"]):
         return jsonify(ok=False, error="That folder does not exist")
-    write_env(cfg)
+    script = find_script()
+    if not script.exists():
+        return jsonify(ok=False, error="ThatsCap.py was not found. Keep the EasyInstall folder inside the main ThatsCap folder.")
+    try:
+        write_env(cfg)
+    except OSError as exc:
+        return jsonify(ok=False, error="Could not save settings: %s" % exc)
+    # Settings go to the child as real environment variables. ThatsCap.py's
+    # load_dotenv() never overrides these, so they win over any other .env.
+    env = os.environ.copy()
+    env.update(read_env())
+    env.update(
+        PYTHONUNBUFFERED="1",
+        PYTHONIOENCODING="utf-8",
+        TQDM_DISABLE="1",
+        HF_HUB_DISABLE_PROGRESS_BARS="1",
+    )
     with _proc_lock:
         if is_running():
             return jsonify(ok=False, error="Already running")
         _log.clear()
         _proc = subprocess.Popen(
-            [sys.executable, str(BASE_DIR / "ThatsCap.py")],
-            cwd=str(BASE_DIR),
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -138,14 +191,9 @@ def api_start():
 
 @app.post("/api/stop")
 def api_stop():
-    global _proc
     if not is_running():
         return jsonify(ok=False, error="Not running")
-    _proc.terminate()
-    try:
-        _proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        _proc.kill()
+    _stop_proc()
     _log.append("--- stopped ---")
     return jsonify(ok=True)
 
@@ -185,7 +233,7 @@ def api_open():
     return jsonify(ok=True)
 
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -226,7 +274,7 @@ PAGE = """<!doctype html>
 <div class="wrap">
   <h1>&#127916; ThatsCap</h1>
   <p class="sub">Automatically add captions to your gameplay clips. Pick a folder, press Start, done.</p>
-  <div class="warn" id="ffwarn">&#9888; FFmpeg was not found. Re-run <b>setup_windows.bat</b> (or restart your PC) to fix this.</div>
+  <div class="warn" id="ffwarn">&#9888; FFmpeg was not found. Re-run <b>quickinstall.bat</b> (or restart your PC) to fix this.</div>
 
   <div class="card">
     <h2>1 &middot; Your clips folder</h2>
